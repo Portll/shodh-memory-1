@@ -54,6 +54,22 @@ pub struct RunInputs {
 /// recorded as `Failure { kind = "case", .. }` entries so a single broken
 /// query does not abort the whole run.
 pub fn run_smoke_suite(inputs: &RunInputs) -> Result<Report> {
+    // ------------------------------------------------------------------
+    // Determinism: pin every parallel runtime to a single thread before
+    // any work touches ONNX or rayon. Multi-threaded float reductions
+    // accumulate in non-deterministic order, which flips ranks on the
+    // recall harness even when no source code has changed.
+    //
+    // - SHODH_ONNX_THREADS=1 → MiniLM/NER intra-op runs single-threaded
+    //   (already plumbed through src/embeddings/{minilm,ner}.rs).
+    // - RAYON_NUM_THREADS=1  → any par_iter() in scoring runs serially.
+    //
+    // We only set these vars if the caller hasn't pinned them already,
+    // so production callers (which never invoke the harness) stay
+    // unaffected.
+    // ------------------------------------------------------------------
+    pin_harness_threads();
+
     let corpus_path = inputs
         .corpus_path
         .clone()
@@ -147,6 +163,32 @@ pub fn run_smoke_suite(inputs: &RunInputs) -> Result<Report> {
         case_count: cases.len(),
         failures,
     })
+}
+
+/// Pin parallel runtimes to a single thread for the harness process.
+///
+/// Recall harness reproducibility requires that two runs of the same query
+/// produce byte-identical rank lists. Multi-threaded float reductions
+/// (RAYON par_iter) and ONNX intra-op parallelism both accumulate sums in
+/// non-deterministic order, which is enough to flip ranks at the
+/// fourth-decimal level.
+///
+/// This function only sets each variable when it is currently unset, so a
+/// caller that explicitly chose a different value (e.g. for a benchmark)
+/// keeps their override.
+fn pin_harness_threads() {
+    // SAFETY: env mutation is process-wide. The harness is the sole entry
+    // point that calls this; the production server never invokes the
+    // recall harness, so we are not racing other readers in any deployed
+    // binary. The recall-eval CLI is single-threaded at startup.
+    unsafe {
+        if std::env::var_os("SHODH_ONNX_THREADS").is_none() {
+            std::env::set_var("SHODH_ONNX_THREADS", "1");
+        }
+        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+            std::env::set_var("RAYON_NUM_THREADS", "1");
+        }
+    }
 }
 
 /// Construct an isolated `MemorySystem` rooted at `storage_path`.
