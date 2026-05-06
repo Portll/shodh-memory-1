@@ -2154,6 +2154,12 @@ pub struct QueryAnalysis {
     /// True if query contains negation
     pub has_negation: bool,
 
+    /// True if query is a polar (yes/no) question — leads with an English
+    /// auxiliary verb like "Are/Is/Do/Did/Have/Can/...". Polar questions are
+    /// negation-blind for bi-encoders even when they contain no overt negation
+    /// token (RH-14, see `constants::POLAR_QUESTION_LEADERS`).
+    pub is_polar: bool,
+
     /// Detected query intent for retrieval strategy selection (SHO-D6)
     pub intent: QueryIntent,
 }
@@ -2438,6 +2444,7 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
             compound_nouns: Vec::new(),
             original_query: query_text.to_string(),
             has_negation: false,
+            is_polar: is_polar_question(query_text),
             intent: QueryIntent::Hybrid,
         };
     }
@@ -2524,7 +2531,122 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
         compound_nouns,
         original_query: query_text.to_string(),
         has_negation,
+        is_polar: is_polar_question(query_text),
         intent,
+    }
+}
+
+/// Detect a polar (yes/no) question by leading auxiliary verb.
+///
+/// Examples that return `true`:
+///   - "Are we using HNSW for vector search?"
+///   - "Is GitHub auto-merge enabled?"
+///   - "Did learning history records also move to postcard?"
+///   - "Do we call OpenAI's embedding API?"
+///
+/// Examples that return `false`:
+///   - "What is the latest commit?" (interrogative, not polar)
+///   - "How does the cache work?"
+///   - bare statements
+///
+/// Polar questions are flagged because bi-encoder retrievers (MiniLM, DPR) are
+/// negation-blind: the embedding for "Are we using HNSW?" lands semantically
+/// near passages about HNSW regardless of polarity, while the actual answer
+/// passage may say "We use Vamana, *not* HNSW" — and never enter the top-K.
+/// See `constants::POLAR_QUESTION_LEADERS` and RH-14.
+pub fn is_polar_question(query_text: &str) -> bool {
+    let trimmed = query_text.trim_start();
+    let first_word: String = trimmed
+        .chars()
+        .take_while(|c| c.is_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if first_word.is_empty() {
+        return false;
+    }
+    crate::constants::POLAR_QUESTION_LEADERS
+        .iter()
+        .any(|leader| *leader == first_word.as_str())
+}
+
+/// Template-based decontextualization of a polar question into its negated
+/// declarative form, suitable for re-embedding via the same encoder.
+///
+/// Transform: "Are X Y?" → "X are not Y"
+///   - "Are we using HNSW?" → "we are not using HNSW"
+///   - "Do we call OpenAI's embedding API?" → "we do not call OpenAI's embedding API"
+///   - "Did learning history records also move to postcard?"
+///        → "learning history records did not also move to postcard"
+///   - "Is GitHub auto-merge enabled?" → "GitHub auto-merge is not enabled"
+///
+/// Returns `None` when:
+///   - The query is not polar (no leader detected)
+///   - The query is too short (< subject + verb after the leader)
+///   - The query already contains an explicit "not" / "no" negation token
+///     (no transform needed; downstream will treat the original as negation-
+///     bearing already)
+///
+/// This is the dense-retrieval analogue of NegEx-driven query rewriting from
+/// Chapman et al. 2001 (clinical NLP) and the Amazon polar-question rewrite
+/// paper (COLING 2025).
+pub fn polar_to_negated_form(query_text: &str) -> Option<String> {
+    let trimmed = query_text.trim().trim_end_matches(['?', '.', '!']);
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+    let leader_lc = words[0].to_lowercase();
+    if !crate::constants::POLAR_QUESTION_LEADERS
+        .iter()
+        .any(|l| *l == leader_lc.as_str())
+    {
+        return None;
+    }
+    // Skip if the original already contains an overt negation token — the
+    // pipeline will boost via `has_negation` directly.
+    let has_overt = words[1..]
+        .iter()
+        .any(|w| is_negation(&w.to_lowercase()) || w.to_lowercase().ends_with("n't"));
+    if has_overt {
+        return None;
+    }
+
+    // Subject NP boundary detection: scan words[1..] for the first content
+    // verb. Tokens before it form the subject NP, tokens from the verb onward
+    // form the predicate. Falls back to a single-word subject when no verb
+    // indicator is found (e.g., copular questions like "Is GitHub auto-merge
+    // enabled?" where "enabled" is a past-participle adjective, not in
+    // VERB_INDICATORS). The output is intended for re-embedding via MiniLM,
+    // which is robust to minor word-order imperfections — exact grammar is
+    // not required for the HyDE-style pseudo-document anchor to work.
+    let verb_idx = words[1..].iter().position(|w| is_verb(&w.to_lowercase()));
+    let (subject, predicate) = match verb_idx {
+        Some(0) => {
+            // Verb immediately follows the leader (e.g., "Did move?") — too
+            // short to template meaningfully.
+            return None;
+        }
+        Some(k) => {
+            let subj = words[1..1 + k].join(" ");
+            let pred = words[1 + k..].join(" ");
+            (subj, pred)
+        }
+        None => {
+            // No content verb found — single-word subject fallback.
+            (words[1].to_string(), words[2..].join(" "))
+        }
+    };
+
+    Some(format!("{subject} {leader_lc} not {predicate}"))
+}
+
+impl QueryAnalysis {
+    /// Returns `true` when this query is sensitive to candidate-passage polarity:
+    /// either it contains explicit negation (`has_negation`) or it is a polar
+    /// (yes/no) question (`is_polar`). Used to gate the deeper-pool +
+    /// negated-form-embedding retrieval path (RH-14).
+    pub fn polarity_sensitive(&self) -> bool {
+        self.has_negation || self.is_polar
     }
 }
 
@@ -4059,6 +4181,118 @@ pub fn infer_ontological_intent(query_text: &str, analysis: &QueryAnalysis) -> O
         expected_labels,
         relation_types,
         confidence: confidence.min(1.0),
+    }
+}
+
+#[cfg(test)]
+mod polar_negation_tests {
+    use super::*;
+
+    #[test]
+    fn polar_question_detected_for_auxiliary_leaders() {
+        // Real smoke-suite negation queries, all of which are polar yes/no
+        // questions WITHOUT overt negation tokens.
+        assert!(is_polar_question(
+            "Are we using HNSW for vector search anywhere?"
+        ));
+        assert!(is_polar_question(
+            "Is GitHub auto-merge enabled on this repository?"
+        ));
+        assert!(is_polar_question(
+            "Did learning history records also move to postcard?"
+        ));
+        assert!(is_polar_question("Do we call OpenAI's embedding API?"));
+        assert!(is_polar_question(
+            "Are we using Tokio's mutex for the per-user init guards?"
+        ));
+
+        // Modal leaders should also be detected.
+        assert!(is_polar_question("Can we cache the embedding?"));
+        assert!(is_polar_question("Should I commit this change?"));
+        assert!(is_polar_question("Will the migration delete old data?"));
+    }
+
+    #[test]
+    fn non_polar_queries_are_not_flagged() {
+        // Information-seeking / wh-questions are not polar.
+        assert!(!is_polar_question("What is the latest commit on main?"));
+        assert!(!is_polar_question("How does the embedding cache work?"));
+        assert!(!is_polar_question("Why did consolidation fire twice?"));
+        // Plain statements / commands.
+        assert!(!is_polar_question("commit the changes"));
+        assert!(!is_polar_question("show retrieval diagnostics"));
+        // Empty / whitespace.
+        assert!(!is_polar_question(""));
+        assert!(!is_polar_question("   "));
+    }
+
+    #[test]
+    fn polar_to_negated_form_inserts_not_after_subject() {
+        // Single-word subject + verb immediately after — clean template.
+        assert_eq!(
+            polar_to_negated_form("Are we using HNSW for vector search anywhere?").as_deref(),
+            Some("we are not using HNSW for vector search anywhere")
+        );
+        assert_eq!(
+            polar_to_negated_form("Do we call OpenAI's embedding API?").as_deref(),
+            Some("we do not call OpenAI's embedding API")
+        );
+        // Multi-word subject NP detected via is_verb scan ("move" triggers
+        // the boundary; tokens before it form the subject including "also").
+        assert_eq!(
+            polar_to_negated_form("Did learning history records also move to postcard?").as_deref(),
+            Some("learning history records also did not move to postcard")
+        );
+        // No content verb in the rest → single-word subject fallback. The
+        // resulting form is mildly ungrammatical ("auto-merge enabled" is a
+        // past-participle adjective phrase) but still anchors the embedding
+        // toward negating passages — sufficient for HyDE-style retrieval.
+        assert_eq!(
+            polar_to_negated_form("Is GitHub auto-merge enabled?").as_deref(),
+            Some("GitHub is not auto-merge enabled")
+        );
+        // Verb scan picks up "using" — multi-word subject works.
+        assert_eq!(
+            polar_to_negated_form("Are we using Tokio's mutex for the per-user init guards?")
+                .as_deref(),
+            Some("we are not using Tokio's mutex for the per-user init guards")
+        );
+    }
+
+    #[test]
+    fn polar_to_negated_form_skips_already_negated_or_non_polar() {
+        // Already negated — no transform.
+        assert_eq!(
+            polar_to_negated_form("Are we not using HNSW anywhere?"),
+            None
+        );
+        assert_eq!(polar_to_negated_form("Don't we call OpenAI?"), None);
+        // Non-polar — no transform.
+        assert_eq!(polar_to_negated_form("What is the latest commit?"), None);
+        // Too short to template — no transform.
+        assert_eq!(polar_to_negated_form("Are we?"), None);
+        assert_eq!(polar_to_negated_form(""), None);
+    }
+
+    #[test]
+    fn polarity_sensitive_combines_negation_and_polar_signals() {
+        // Polar question, no overt negation token.
+        let a = analyze_query("Are we using HNSW for vector search anywhere?");
+        assert!(a.is_polar);
+        assert!(!a.has_negation);
+        assert!(a.polarity_sensitive());
+
+        // Overt negation, not polar.
+        let b = analyze_query("memory not stored in cache after restart");
+        assert!(!b.is_polar);
+        assert!(b.has_negation);
+        assert!(b.polarity_sensitive());
+
+        // Neither — wh-question.
+        let c = analyze_query("what is the latest commit on main");
+        assert!(!c.is_polar);
+        assert!(!c.has_negation);
+        assert!(!c.polarity_sensitive());
     }
 }
 

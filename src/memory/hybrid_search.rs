@@ -575,6 +575,15 @@ impl HybridSearchEngine {
         self.bm25_index.commit()
     }
 
+    /// Configured BM25 candidate pool depth (top-K passed to Tantivy by default).
+    ///
+    /// Exposed so callers (e.g., the polarity-aware retrieval path in
+    /// `MemorySystem::semantic_retrieve_inner`, RH-14) can derive overrides
+    /// proportional to the configured baseline rather than hardcoding a value.
+    pub fn candidate_count(&self) -> usize {
+        self.config.candidate_count
+    }
+
     /// Reload BM25 reader to see committed changes immediately
     pub fn reload(&self) -> Result<()> {
         self.bm25_index.reload()
@@ -695,7 +704,7 @@ impl HybridSearchEngine {
         &self,
         query: &str,
         vector_results: Vec<(MemoryId, f32)>,
-        _get_content: F,
+        get_content: F,
         term_weights: Option<&HashMap<String, f32>>,
         phrase_boosts: Option<&[(String, f32)]>,
         keyword_discriminativeness: Option<f32>,
@@ -703,10 +712,44 @@ impl HybridSearchEngine {
     where
         F: Fn(&MemoryId) -> Option<String>,
     {
+        self.search_with_dynamic_weights_pool(
+            query,
+            vector_results,
+            get_content,
+            term_weights,
+            phrase_boosts,
+            keyword_discriminativeness,
+            None,
+        )
+    }
+
+    /// Variant of `search_with_dynamic_weights` that allows the caller to
+    /// override the BM25 candidate pool depth.
+    ///
+    /// Used by the polarity-aware retrieval path (RH-14): when the query is
+    /// polar/negation-sensitive, the pool is multiplied by
+    /// `POLAR_QUERY_BM25_POOL_MULTIPLIER` so that passages containing negation
+    /// markers near the focal entity have a chance to enter the candidate set.
+    /// Pure post-fusion reranking cannot rescue passages that were never
+    /// retrieved — see arXiv 2603.17580 ("Negation is Not Semantic").
+    pub fn search_with_dynamic_weights_pool<F>(
+        &self,
+        query: &str,
+        vector_results: Vec<(MemoryId, f32)>,
+        _get_content: F,
+        term_weights: Option<&HashMap<String, f32>>,
+        phrase_boosts: Option<&[(String, f32)]>,
+        keyword_discriminativeness: Option<f32>,
+        bm25_pool_override: Option<usize>,
+    ) -> Result<Vec<HybridSearchResult>>
+    where
+        F: Fn(&MemoryId) -> Option<String>,
+    {
         // 1. BM25 search with IC-weighted term boosting AND phrase matching
+        let bm25_pool = bm25_pool_override.unwrap_or(self.config.candidate_count);
         let bm25_results = self.bm25_index.search_with_term_and_phrase_weights(
             query,
-            self.config.candidate_count,
+            bm25_pool,
             term_weights,
             phrase_boosts,
         )?;

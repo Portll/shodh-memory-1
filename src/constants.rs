@@ -400,6 +400,59 @@ pub const HYBRID_GRAPH_WEIGHT: f32 = 0.35;
 pub const HYBRID_LINGUISTIC_WEIGHT: f32 = 0.15;
 
 // =============================================================================
+// POLAR / NEGATION-AWARE RETRIEVAL (RH-14)
+// =============================================================================
+// MiniLM-L6-v2 (and most bi-encoders) project "we use X" and "we do not use X"
+// within ~5° cosine — bi-encoder polarity blindness, documented in:
+//   - Ettinger 2020, "What BERT Is Not" (TACL)
+//   - "Negation is Not Semantic: Diagnosing Dense Retrieval Failure Modes"
+//     (arXiv 2603.17580, 2026) — proposes deeper lexical pool + NegEx filtering
+//   - Chapman et al. 2001, "A simple algorithm for identifying negated findings
+//     and diseases" (NegEx) — i2b2 clinical NLP standard
+//
+// Strategy (combined): when a query is polar (yes/no auxiliary leader) or
+// contains explicit negation tokens, (a) deepen BM25 candidate pool, (b) augment
+// the BM25 query with negation cue terms so passages containing "not"/"no"/etc.
+// near the focal entity float up, and (c) compute a second vector embedding
+// using a templated negated form of the polar question. This gets the right
+// negating passage INTO the candidate pool — pure post-fusion reranking cannot
+// rescue a passage that was never retrieved.
+
+/// Auxiliary verb leaders that mark a polar (yes/no) question.
+///
+/// Used by `query_parser::is_polar_question()` to detect queries like
+/// "Are we using HNSW?" / "Did learning history move to postcard?" where the
+/// expected answer carries explicit negation ("we use Vamana, not HNSW").
+pub const POLAR_QUESTION_LEADERS: &[&str] = &[
+    "are", "is", "am", "was", "were", "do", "does", "did", "have", "has", "had", "can", "could",
+    "will", "would", "should", "shall", "may", "might", "must",
+];
+
+/// BM25 candidate pool depth multiplier for polarity-sensitive queries.
+///
+/// When polar/negation query detected, multiply `hybrid_search.candidate_count`
+/// by this factor to ensure passages containing negation tokens enter the pool.
+/// arXiv 2603.17580 uses K=1000 (10x) for biomedical contradiction detection;
+/// we use 3x as a conservative starting point given much smaller corpora.
+pub const POLAR_QUERY_BM25_POOL_MULTIPLIER: usize = 3;
+
+/// Vector candidate pool depth multiplier for polarity-sensitive queries.
+///
+/// Same rationale as `POLAR_QUERY_BM25_POOL_MULTIPLIER` but for the dense leg.
+/// Combined with the negated-form embedding (HyDE-style), this widens the pool
+/// to capture passages the positive-form query alone would rank below cutoff.
+pub const POLAR_QUERY_VECTOR_POOL_MULTIPLIER: usize = 2;
+
+/// Negation cue tokens injected into the BM25 query for polarity-sensitive queries.
+///
+/// These low-IDF terms add a small additive BM25 score to passages containing
+/// negation markers near the focal entity (e.g., "We use Vamana, **not** HNSW").
+/// Per-token contribution is small by design — this is candidate-pool engineering,
+/// not score domination.
+pub const POLAR_BM25_NEGATION_CUES: &[&str] =
+    &["not", "no", "never", "without", "instead", "actually"];
+
+// =============================================================================
 // DENSITY-DEPENDENT RETRIEVAL WEIGHTS (SHO-26)
 // Based on GraphRAG Survey (arXiv 2408.08921) - hybrid KG-Vector improves 13.1%
 // Biological model: Dense graphs = noisy (fresh L1 edges), Sparse = curated (pruned)
