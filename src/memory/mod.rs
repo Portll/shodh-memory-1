@@ -1852,6 +1852,56 @@ impl MemorySystem {
                 }
             };
 
+        // ===========================================================================
+        // POLARITY-AWARE NEGATED-FORM EMBEDDING (RH-14)
+        // ===========================================================================
+        // For polar/negation-sensitive queries, generate a second embedding from
+        // the templated negated form ("Are we using HNSW?" → "we are not using
+        // HNSW"). The negated-form embedding lands much closer in MiniLM space
+        // to passages that overtly contradict the polar premise (e.g.,
+        // "We use Vamana, not HNSW") than the original positive-form embedding
+        // does. Used downstream to widen the vector candidate pool. See
+        // `query_parser::polar_to_negated_form` and arXiv 2603.17580.
+        let polar_negated_embedding: Option<Vec<f32>> = if query_analysis.polarity_sensitive()
+            && !embedding_query_text.is_empty()
+        {
+            if let Some(neg_text) =
+                crate::memory::query_parser::polar_to_negated_form(&embedding_query_text)
+            {
+                let neg_hash = Self::sha256_hash(&neg_text);
+                if let Some(cached) = self.query_cache.get(&neg_hash) {
+                    EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
+                    Some(cached.clone())
+                } else {
+                    EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
+                    match self.embedder.as_ref().encode(&neg_text) {
+                        Ok(emb) => {
+                            self.query_cache.insert(neg_hash, emb.clone());
+                            EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
+                            tracing::debug!(
+                                "Polar negated-form embedding generated: '{}' → '{}'",
+                                &*embedding_query_text,
+                                neg_text
+                            );
+                            Some(emb)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Polar negated-form encode failed for '{}': {}",
+                                neg_text,
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let t_embedding = recall_start.elapsed();
         tracing::info!(
             embedding_ms = format!(
@@ -1859,6 +1909,8 @@ impl MemorySystem {
                 (t_embedding - t_query_analysis).as_secs_f64() * 1000.0
             ),
             cumulative_ms = format!("{:.2}", t_embedding.as_secs_f64() * 1000.0),
+            polarity_sensitive = query_analysis.polarity_sensitive(),
+            polar_neg_embedding = polar_negated_embedding.is_some(),
             "recall [layer:embedding] query embedding (cache miss logged above if any)"
         );
         if let Some(ref mut s) = stats {
@@ -2109,11 +2161,50 @@ impl MemorySystem {
         };
 
         // ===========================================================================
-        // LAYER 3: VECTOR SEARCH (Vamana Index)
+        // LAYER 3: VECTOR SEARCH (Vamana Index) — polarity-aware union (RH-14)
         // ===========================================================================
-        let vr = self
-            .retriever
-            .search_ids(&vector_query, query.max_results * 3)?;
+        // For polarity-sensitive queries the candidate pool is widened in two
+        // ways: (a) the per-leg top-k is multiplied by
+        // POLAR_QUERY_VECTOR_POOL_MULTIPLIER, and (b) a second search is run
+        // using the negated-form embedding when available. Results are unioned
+        // by MemoryId, keeping the *best* (largest) similarity score and
+        // rebuilding a deterministic descending order. This ensures passages
+        // that overtly contradict a polar premise enter the BM25/RRF fusion
+        // pool downstream — they cannot be rescued by post-fusion reranking
+        // alone, since the bi-encoder ranks them below the cutoff.
+        let polar_vec_mul = if query_analysis.polarity_sensitive() {
+            crate::constants::POLAR_QUERY_VECTOR_POOL_MULTIPLIER.max(1)
+        } else {
+            1
+        };
+        let vector_top_k = query.max_results * 3 * polar_vec_mul;
+        let vr_pos = self.retriever.search_ids(&vector_query, vector_top_k)?;
+        let vr = if let Some(neg_emb) = polar_negated_embedding.as_ref() {
+            let mut neg_query = vector_query.clone();
+            neg_query.query_embedding = Some(neg_emb.clone());
+            let vr_neg = self
+                .retriever
+                .search_ids(&neg_query, vector_top_k)
+                .unwrap_or_default();
+            // Union by MemoryId, keep best score per id; deterministic ordering
+            // by (score desc, id asc) — matches RH-10 stable tie-break.
+            let mut best: std::collections::HashMap<MemoryId, f32> =
+                std::collections::HashMap::with_capacity(vr_pos.len() + vr_neg.len());
+            for (id, score) in vr_pos.into_iter().chain(vr_neg.into_iter()) {
+                best.entry(id)
+                    .and_modify(|s| {
+                        if score > *s {
+                            *s = score;
+                        }
+                    })
+                    .or_insert(score);
+            }
+            let mut merged: Vec<(MemoryId, f32)> = best.into_iter().collect();
+            merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            merged
+        } else {
+            vr_pos
+        };
         let vector_results: Vec<(MemoryId, f32)> = if let Some(ref c) = episode_candidates {
             vr.into_iter().filter(|(id, _)| c.contains(id)).collect()
         } else {
@@ -2176,15 +2267,48 @@ impl MemorySystem {
             } else {
                 None
             };
+
+            // Polarity-aware BM25 augmentation (RH-14):
+            //  • Augment the query string with low-IDF negation cue tokens so
+            //    passages containing "not"/"no"/"never"/etc. near the focal
+            //    entity gain a small additive BM25 score (e.g. ssm-056 says
+            //    "We use Vamana, not HNSW" — adding "not" to the BM25 query
+            //    for "Are we using HNSW?" floats it up).
+            //  • Deepen the BM25 candidate pool so the augmented terms have
+            //    room to surface borderline-relevant passages.
+            // See `constants::POLAR_BM25_NEGATION_CUES` and
+            // `constants::POLAR_QUERY_BM25_POOL_MULTIPLIER`.
+            let polarity_sensitive = query_analysis.polarity_sensitive();
+            let bm25_query_owned: String;
+            let bm25_query_text: &str = if polarity_sensitive {
+                bm25_query_owned = format!(
+                    "{} {}",
+                    query_text,
+                    crate::constants::POLAR_BM25_NEGATION_CUES.join(" ")
+                );
+                &bm25_query_owned
+            } else {
+                query_text
+            };
+            let bm25_pool_override = if polarity_sensitive {
+                Some(
+                    self.hybrid_search
+                        .candidate_count()
+                        .saturating_mul(crate::constants::POLAR_QUERY_BM25_POOL_MULTIPLIER),
+                )
+            } else {
+                None
+            };
             let hybrid_ids = self
                 .hybrid_search
-                .search_with_dynamic_weights(
-                    query_text,
+                .search_with_dynamic_weights_pool(
+                    bm25_query_text,
                     vector_results.clone(),
                     get_content,
                     term_weights,
                     phrases,
                     disc_opt,
+                    bm25_pool_override,
                 )
                 .map(|r| {
                     r.into_iter()
