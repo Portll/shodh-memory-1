@@ -237,12 +237,7 @@ fn summarise(report: &Report) {
         if let Some(layer) = report.layers.get(name) {
             eprintln!(
                 "  {:<12} ndcg@10={:.4} recall@10={:.4} mrr={:.4} p@1={:.4} map={:.4}",
-                name,
-                layer.ndcg_at_10,
-                layer.recall_at_10,
-                layer.mrr,
-                layer.p_at_1,
-                layer.map
+                name, layer.ndcg_at_10, layer.recall_at_10, layer.mrr, layer.p_at_1, layer.map
             );
         }
     }

@@ -1773,34 +1773,35 @@ impl MemorySystem {
 
             if layer_facts {
                 if let Some(user_id) = &query.user_id {
-                let entity_names: Vec<String> = query_analysis
-                    .focal_entities
-                    .iter()
-                    .map(|e| e.text.to_lowercase())
-                    .collect();
+                    let entity_names: Vec<String> = query_analysis
+                        .focal_entities
+                        .iter()
+                        .map(|e| e.text.to_lowercase())
+                        .collect();
 
-                if !entity_names.is_empty() {
-                    if let Ok(facts) = self.get_facts_for_graph_entities(user_id, &entity_names, 5)
-                    {
-                        for fact in &facts {
-                            if fact.confidence < 0.5 || fact.support_count < 3 {
-                                continue;
+                    if !entity_names.is_empty() {
+                        if let Ok(facts) =
+                            self.get_facts_for_graph_entities(user_id, &entity_names, 5)
+                        {
+                            for fact in &facts {
+                                if fact.confidence < 0.5 || fact.support_count < 3 {
+                                    continue;
+                                }
+                                let per_fact_boost = fact.confidence * 0.08;
+                                for src_id in &fact.source_memories {
+                                    let entry = boosts.entry(src_id.clone()).or_insert(0.0);
+                                    *entry = (*entry + per_fact_boost).min(0.3);
+                                }
                             }
-                            let per_fact_boost = fact.confidence * 0.08;
-                            for src_id in &fact.source_memories {
-                                let entry = boosts.entry(src_id.clone()).or_insert(0.0);
-                                *entry = (*entry + per_fact_boost).min(0.3);
+                            if !boosts.is_empty() {
+                                tracing::debug!(
+                                    "Layer 0.7: Pre-fetched {} fact-source boosts from {} facts",
+                                    boosts.len(),
+                                    facts.len()
+                                );
                             }
-                        }
-                        if !boosts.is_empty() {
-                            tracing::debug!(
-                                "Layer 0.7: Pre-fetched {} fact-source boosts from {} facts",
-                                boosts.len(),
-                                facts.len()
-                            );
                         }
                     }
-                }
                 }
             }
             boosts
@@ -2624,62 +2625,64 @@ impl MemorySystem {
             // RH-8 gate: prospective signal boost only runs in `Full` mode.
             if layer_full {
                 if let Some(ref signals) = query.prospective_signals {
-                if !signals.is_empty() {
-                    use crate::constants::{PROSPECTIVE_BOOST_MAX, PROSPECTIVE_BOOST_PER_MATCH};
+                    if !signals.is_empty() {
+                        use crate::constants::{
+                            PROSPECTIVE_BOOST_MAX, PROSPECTIVE_BOOST_PER_MATCH,
+                        };
 
-                    // Tokenize all signals into unique terms (skip noise words < 3 chars)
-                    let signal_terms: std::collections::HashSet<String> = signals
-                        .iter()
-                        .flat_map(|s| {
-                            s.to_lowercase()
-                                .split_whitespace()
-                                .filter(|w| w.len() >= 3)
-                                .map(|w| w.to_string())
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
+                        // Tokenize all signals into unique terms (skip noise words < 3 chars)
+                        let signal_terms: std::collections::HashSet<String> = signals
+                            .iter()
+                            .flat_map(|s| {
+                                s.to_lowercase()
+                                    .split_whitespace()
+                                    .filter(|w| w.len() >= 3)
+                                    .map(|w| w.to_string())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
 
-                    if !signal_terms.is_empty() {
-                        let mut boosted_count = 0;
-                        let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                        if !signal_terms.is_empty() {
+                            let mut boosted_count = 0;
+                            let ids: Vec<MemoryId> = fused.keys().cloned().collect();
 
-                        for id in &ids {
-                            if let Some(content) = get_content(id) {
-                                let content_lower = content.to_lowercase();
-                                let content_words = tokenize_words(&content_lower);
-                                let match_count = signal_terms
-                                    .iter()
-                                    .filter(|term| content_words.contains(term.as_str()))
-                                    .count();
+                            for id in &ids {
+                                if let Some(content) = get_content(id) {
+                                    let content_lower = content.to_lowercase();
+                                    let content_words = tokenize_words(&content_lower);
+                                    let match_count = signal_terms
+                                        .iter()
+                                        .filter(|term| content_words.contains(term.as_str()))
+                                        .count();
 
-                                if match_count > 0 {
-                                    // Sqrt scaling: diminishing returns for additional matches
-                                    let boost_factor = 1.0
-                                        + (PROSPECTIVE_BOOST_PER_MATCH
-                                            * (match_count as f32).sqrt())
-                                        .min(PROSPECTIVE_BOOST_MAX);
-                                    if let Some(score) = fused.get_mut(id) {
-                                        *score *= boost_factor;
-                                        boosted_count += 1;
-                                        if let Some(ref mut attr_map) = attributions {
-                                            if let Some(attr) = attr_map.get_mut(id) {
-                                                attr.prospective_boost = boost_factor;
+                                    if match_count > 0 {
+                                        // Sqrt scaling: diminishing returns for additional matches
+                                        let boost_factor = 1.0
+                                            + (PROSPECTIVE_BOOST_PER_MATCH
+                                                * (match_count as f32).sqrt())
+                                            .min(PROSPECTIVE_BOOST_MAX);
+                                        if let Some(score) = fused.get_mut(id) {
+                                            *score *= boost_factor;
+                                            boosted_count += 1;
+                                            if let Some(ref mut attr_map) = attributions {
+                                                if let Some(attr) = attr_map.get_mut(id) {
+                                                    attr.prospective_boost = boost_factor;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        if boosted_count > 0 {
-                            tracing::info!(
+                            if boosted_count > 0 {
+                                tracing::info!(
                                 "Layer 4.7: Boosted {} memories from {} prospective signal terms",
                                 boosted_count,
                                 signal_terms.len()
                             );
+                            }
                         }
                     }
-                }
                 }
             }
 
@@ -3158,29 +3161,29 @@ impl MemorySystem {
         // RH-8 gate: quality multiplier only applies in `Full` mode — lower modes
         // expose the raw fused score so per-layer attribution isn't masked.
         if layer_full {
-        for mem in &mut memories {
-            let content_len = mem.experience.content.len() as f32;
-            let has_entities = !mem.experience.entities.is_empty();
-            let has_context = mem.experience.context.is_some();
-            let quality = (content_len / 200.0).min(1.0)
-                * (1.0
-                    + if has_entities { 0.1 } else { 0.0 }
-                    + if has_context { 0.1 } else { 0.0 });
-            let quality_factor = quality.max(crate::constants::ELABORATION_QUALITY_MIN);
-            if let Some(score) = mem.score {
-                let mut cloned: Memory = mem.as_ref().clone();
-                cloned.set_score(score * quality_factor);
-                *mem = Arc::new(cloned);
+            for mem in &mut memories {
+                let content_len = mem.experience.content.len() as f32;
+                let has_entities = !mem.experience.entities.is_empty();
+                let has_context = mem.experience.context.is_some();
+                let quality = (content_len / 200.0).min(1.0)
+                    * (1.0
+                        + if has_entities { 0.1 } else { 0.0 }
+                        + if has_context { 0.1 } else { 0.0 });
+                let quality_factor = quality.max(crate::constants::ELABORATION_QUALITY_MIN);
+                if let Some(score) = mem.score {
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(score * quality_factor);
+                    *mem = Arc::new(cloned);
 
-                // Track quality gate in attribution
-                if let Some(ref mut attr_map) = attributions {
-                    if let Some(attr) = attr_map.get_mut(&mem.id) {
-                        attr.quality_gate = quality_factor;
-                        attr.final_score = score * quality_factor;
+                    // Track quality gate in attribution
+                    if let Some(ref mut attr_map) = attributions {
+                        if let Some(attr) = attr_map.get_mut(&mem.id) {
+                            attr.quality_gate = quality_factor;
+                            attr.final_score = score * quality_factor;
+                        }
                     }
                 }
             }
-        }
         }
 
         // Linguistic analysis: additive boost (5% of IC weight), not a full re-sort
