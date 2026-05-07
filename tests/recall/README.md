@@ -6,8 +6,10 @@ the `recall-eval` binary (see `src/bin/recall_eval.rs`).
 ## Files
 
 - `corpora/shodh-smoke.jsonl` — L1 smoke corpus (memories ingested by the runner).
-- `smoke_cases.jsonl` — 30 hand-crafted query cases with graded relevance labels,
+- `smoke_cases.jsonl` — 40 hand-crafted query cases with graded relevance labels,
   spanning six categories (decision / code / temporal / entity / multi_hop / negation).
+  The negation category was grown from 5 → 15 cases in RH-14b so the per-case
+  metric quantum on that category dropped from ~0.20 to ~0.067.
 - `baseline.json` — frozen per-metric scores against current `main`. Every PR is
   measured against this; regressions beyond the configured tolerance fail CI
   (see issue #267 / RH-5).
@@ -38,6 +40,7 @@ justification in the PR description so future bisects have context.
 
 ## Regeneration history
 
-| Date       | SHA       | Embedder       | Notes                          |
-| ---------- | --------- | -------------- | ------------------------------ |
-| 2026-05-03 | `6756665` | minilm-l6-v2   | Initial capture (RH-6, #268).  |
+| Date       | SHA       | Embedder       | Notes                                                    |
+| ---------- | --------- | -------------- | -------------------------------------------------------- |
+| 2026-05-03 | `6756665` | minilm-l6-v2   | Initial capture (RH-6, #268).                            |
+| 2026-05-07 | `<TBD>`   | minilm-l6-v2   | Corpus growth: +6 docs, +10 negation cases (RH-14b prep). |
