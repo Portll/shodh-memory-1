@@ -154,9 +154,36 @@ const MAX_LIMIT = 250;              // Max results per query
 // TOKEN TRACKING - Context window awareness (SHO-115)
 // =============================================================================
 
-// Token budget configuration (default 100k tokens, ~400k chars)
-const TOKEN_BUDGET = parseInt(process.env.SHODH_TOKEN_BUDGET || "100000", 10);
-const ALERT_THRESHOLD = parseFloat(process.env.SHODH_ALERT_THRESHOLD || "0.9");
+// Parse a numeric env var with validation. A malformed (NaN) or out-of-range
+// value would otherwise silently break token tracking — e.g. a NaN budget makes
+// `tokens / budget` NaN so alerts never fire; a 0 budget makes it Infinity so
+// they always fire. Reject anything outside [min, max] and use the default.
+function parseEnvNumber(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.error(
+      `[shodh-memory] Invalid numeric env value "${raw}" (expected ${min}..${max}) — using default ${fallback}.`,
+    );
+    return fallback;
+  }
+  return n;
+}
+
+// Token budget configuration (default 100k tokens, ~400k chars).
+// Budget: a positive integer. Alert threshold: a fraction in (0, 1].
+const TOKEN_BUDGET = parseEnvNumber(
+  process.env.SHODH_TOKEN_BUDGET,
+  100_000,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const ALERT_THRESHOLD = parseEnvNumber(process.env.SHODH_ALERT_THRESHOLD, 0.9, 0.01, 1);
 
 // Content-aware token tracker (replaces naive len/4 with CJK/code/prose heuristic)
 const tokenTracker = new TokenTracker(TOKEN_BUDGET, ALERT_THRESHOLD);
@@ -4605,7 +4632,10 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       }
 
       case "recent_memories": {
-        const count = parseInt((args.count as string) || "10", 10);
+        // Guard against a non-numeric or non-positive `count` arg (parseInt → NaN
+        // would serialize to JSON null and silently fall back to the server default).
+        const countRaw = parseInt((args.count as string) || "10", 10);
+        const count = Number.isFinite(countRaw) && countRaw > 0 ? countRaw : 10;
         const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
           user_id: USER_ID,
           limit: count,
