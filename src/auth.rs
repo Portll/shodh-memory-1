@@ -120,26 +120,24 @@ impl IntoResponse for AuthError {
 /// Compares all bytes of both strings to prevent length-based timing leaks.
 /// The comparison time is constant regardless of where differences occur.
 pub(crate) fn constant_time_compare(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    let a_len = a_bytes.len();
-    let b_len = b_bytes.len();
-    let max_len = std::cmp::max(a_len, b_len);
 
-    // Track whether lengths match (0 if equal, non-zero otherwise)
-    // Use u32 to avoid truncation: (usize as u8) wraps at 256, so lengths
-    // differing by a multiple of 256 would falsely compare as equal.
-    let mut result: u32 = (a_len ^ b_len) as u32;
+    // Equal-length normalisation: `subtle`'s slice `ct_eq` is only constant-time
+    // for equal-length inputs (it returns early on a length mismatch). When the
+    // lengths differ we run a fixed dummy compare and then fail via `len_match`,
+    // so the comparison cost does not leak length information.
+    let len_match = a_bytes.len() == b_bytes.len();
+    let bytes_eq = if len_match {
+        bool::from(a_bytes.ct_eq(b_bytes))
+    } else {
+        let _ = bool::from(b_bytes.ct_eq(b_bytes));
+        false
+    };
 
-    // Compare all bytes up to max_len, using 0 for out-of-bounds indices
-    // This ensures constant time regardless of actual lengths
-    for i in 0..max_len {
-        let byte_a = if i < a_len { a_bytes[i] } else { 0 };
-        let byte_b = if i < b_len { b_bytes[i] } else { 0 };
-        result |= (byte_a ^ byte_b) as u32;
-    }
-
-    result == 0
+    len_match && bytes_eq
 }
 
 /// Validate API key against configured keys using constant-time comparison

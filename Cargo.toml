@@ -194,6 +194,10 @@ hex = "0.4"
 
 # MIF encryption (AES-256-GCM)
 aes-gcm = "0.10"
+# Zeroize key material on drop (field-level encryption)
+zeroize = { version = "1", features = ["derive"] }
+# Constant-time equality for API key comparison
+subtle = "2.6"
 
 # External integrations (SHO-40)
 hmac = "0.12"

@@ -16,6 +16,7 @@
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod downloader;
+pub mod http_embedder;
 pub mod keywords;
 pub mod minilm;
 pub mod ner;
@@ -37,6 +38,9 @@ pub use ner::{NerConfig, NerEntity, NerEntityType, NeuralNer};
 
 // Re-export keyword types
 pub use keywords::{Keyword, KeywordConfig, KeywordExtractor};
+
+// Re-export HTTP embedder types
+pub use http_embedder::{HttpEmbedder, HttpEmbedderConfig};
 
 // Re-export circuit breaker types
 pub use circuit_breaker::{

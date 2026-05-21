@@ -8,7 +8,7 @@ use rocksdb::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::types::*;
 
@@ -695,7 +695,7 @@ impl LegacyMemoryV2 {
 ///
 /// Returns (Memory, needs_migration) where needs_migration=true means the data
 /// was in a legacy format and should be re-written for future performance.
-fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
+fn deserialize_memory_inner(data: &[u8]) -> Result<(Memory, bool)> {
     use crate::serialization::{SHO_VERSION_BINCODE2, SHO_VERSION_POSTCARD};
 
     // Check for versioned format: SHO + version byte + payload + 4-byte CRC32
@@ -725,6 +725,102 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
         deserialize_with_fallback(data)
             .map_err(|e| anyhow!("legacy (no SHO header) decode failed: {e}"))
     }
+}
+
+// ============================================================================
+// FIELD-LEVEL ENCRYPTION
+// Centralized encrypt-before-serialize / decrypt-after-deserialize logic so
+// every storage path transparently encrypts the `content` field at rest when
+// SHODH_ENCRYPTION_KEY is configured. See `crate::encryption`.
+// ============================================================================
+
+/// Process-global field-level content encryptor, initialised once from
+/// `SHODH_ENCRYPTION_KEY`. `None` means encryption is disabled (the default).
+static CONTENT_ENCRYPTOR: OnceLock<Option<crate::encryption::FieldEncryptor>> = OnceLock::new();
+
+/// Return the process-global content encryptor, or `None` when encryption is
+/// disabled. Initialised lazily on first use; a malformed key is logged loudly
+/// and treated as disabled rather than silently corrupting writes.
+fn encryptor() -> Option<&'static crate::encryption::FieldEncryptor> {
+    CONTENT_ENCRYPTOR
+        .get_or_init(|| match crate::encryption::FieldEncryptor::from_env() {
+            Ok(enc) => enc,
+            Err(e) => {
+                tracing::error!(
+                    "SHODH_ENCRYPTION_KEY is set but invalid — content encryption DISABLED: {e}"
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Serialize a memory to bytes, encrypting the `content` field if encryption is enabled.
+///
+/// When encryption is configured, the plaintext content is encrypted and stored
+/// base64-encoded in the content field (raw ciphertext is not valid UTF-8), then
+/// the whole memory is serialized normally. With no key configured this is a
+/// plain `encode_sho`, so existing plaintext stores are unaffected.
+pub(crate) fn encode_memory(memory: &Memory) -> Result<Vec<u8>> {
+    match encryptor() {
+        Some(enc) => {
+            let encrypted_bytes = enc
+                .encrypt_content(&memory.experience.content)
+                .context("Failed to encrypt memory content")?;
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes);
+            let mut encrypted_memory = memory.clone();
+            encrypted_memory.experience.content = encoded;
+            crate::serialization::encode_sho(&encrypted_memory)
+        }
+        None => crate::serialization::encode_sho(memory),
+    }
+}
+
+/// Decrypt the `content` field of a memory in-place if it was stored encrypted.
+///
+/// Checks whether the content is base64-encoded encrypted data (decodes and
+/// looks for the `ENC\0` marker). Plaintext content — including legacy data
+/// written before encryption was enabled — is left unchanged.
+fn decrypt_memory_content(memory: &mut Memory) {
+    let enc = match encryptor() {
+        Some(enc) => enc,
+        None => return,
+    };
+
+    use base64::Engine;
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content)
+    {
+        Ok(bytes) => bytes,
+        Err(_) => return, // Not base64 — plaintext content, leave unchanged
+    };
+
+    if !crate::encryption::FieldEncryptor::is_encrypted(&decoded) {
+        return; // No encryption marker — plaintext that happens to be valid base64
+    }
+
+    match enc.decrypt_content(&decoded) {
+        Ok(plaintext) => {
+            memory.experience.content = plaintext;
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to decrypt content for memory {} (leaving encrypted): {}",
+                memory.id.0,
+                e
+            );
+        }
+    }
+}
+
+/// Deserialize a memory, decrypting the `content` field if encryption is enabled.
+///
+/// Thin wrapper over [`deserialize_memory_inner`] so every read path
+/// transparently decrypts. See [`encode_memory`] for the write side.
+fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
+    let (mut memory, needs_migration) = deserialize_memory_inner(data)?;
+    decrypt_memory_content(&mut memory);
+    Ok((memory, needs_migration))
 }
 
 /// Public wrapper around the full legacy fallback chain, used by the migration module.
@@ -1422,8 +1518,8 @@ impl MemoryStorage {
         let key = memory.id.0.as_bytes();
 
         // Serialize memory (postcard + SHO v2 envelope)
-        let value = crate::serialization::encode_sho(memory)
-            .context(format!("Failed to serialize memory {}", memory.id.0))?;
+        let value =
+            encode_memory(memory).context(format!("Failed to serialize memory {}", memory.id.0))?;
 
         // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
@@ -1715,8 +1811,7 @@ impl MemoryStorage {
     /// Re-write a memory in current format (lazy migration helper)
     fn migrate_memory_format(&self, memory: &Memory) -> Result<()> {
         let key = memory.id.0.as_bytes();
-        let value = crate::serialization::encode_sho(memory)
-            .context("Failed to serialize for migration")?;
+        let value = encode_memory(memory).context("Failed to serialize for migration")?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false); // Async is fine for migration
@@ -2626,7 +2721,7 @@ impl MemoryStorage {
                         .metadata
                         .insert("forgotten_at".to_string(), now.clone());
 
-                    let updated_value = crate::serialization::encode_sho(&memory)?;
+                    let updated_value = encode_memory(&memory)?;
                     batch.put(&key, updated_value);
                 }
             }
@@ -2669,7 +2764,7 @@ impl MemoryStorage {
                         .metadata
                         .insert("forgotten_at".to_string(), now.clone());
 
-                    let updated_value = crate::serialization::encode_sho(&memory)?;
+                    let updated_value = encode_memory(&memory)?;
                     batch.put(&key, updated_value);
                 }
             }
@@ -2959,7 +3054,7 @@ impl MemoryStorage {
             write_opts.set_sync(self.write_mode == WriteMode::Sync);
 
             for (key, memory) in to_migrate {
-                match crate::serialization::encode_sho(&memory) {
+                match encode_memory(&memory) {
                     Ok(serialized) => {
                         if let Err(e) = self.db.put_opt(&key, &serialized, &write_opts) {
                             tracing::warn!("Failed to migrate memory: {e}");
@@ -3304,8 +3399,8 @@ impl MemoryStorage {
 
         // 1. Serialize memory
         let memory_key = memory.id.0.as_bytes();
-        let memory_value = crate::serialization::encode_sho(memory)
-            .context(format!("Failed to serialize memory {}", memory.id.0))?;
+        let memory_value =
+            encode_memory(memory).context(format!("Failed to serialize memory {}", memory.id.0))?;
         batch.put(memory_key, &memory_value);
 
         // 2. Serialize vector mapping with modality support

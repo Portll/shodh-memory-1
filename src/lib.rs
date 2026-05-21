@@ -22,6 +22,7 @@ pub mod config;
 pub mod constants;
 pub mod decay;
 pub mod embeddings;
+pub mod encryption;
 pub mod errors;
 pub mod graph_memory;
 pub mod handlers;
