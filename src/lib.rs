@@ -27,6 +27,7 @@ pub mod contrastive;
 pub mod decay;
 pub mod dep_parser;
 pub mod embeddings;
+pub mod encryption;
 pub mod entity_resolution;
 pub mod entity_type;
 pub mod errors;
